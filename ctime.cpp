@@ -9,6 +9,9 @@
 std::chrono::steady_clock MASTER_CLOCK; // global monotonic clock for multi-threaded app
 std::mutex LOCK_CONSOLE_OUT;
 
+// experimenting with chrono and threads
+// [] fix duration output - is currently in nano seconds and will not allow seconds ratio
+
 struct thread_timer
 {
     std::chrono::time_point<std::chrono::steady_clock> start_time;
