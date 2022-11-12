@@ -6,24 +6,29 @@
 #include <mutex>
 #include <condition_variable>
 
-/* Broke app with condition_variable locking
-    Threads 1,2,4 always reach max time out wait condition,
-        even with a 2.5x time multiplier
+/* 
+ - This program combines combines knowledge of the chrono and threading libraries
+ - The user enters # threads & # max seconds for a thread to run
+ - App then randomly generates sleep duration for each thread
+ - various locking mechanisms are used to prevent (1) console write race conditions and (2) deadlocks
 */
+
  // preprocessor substitution for readability
 #define CONSOLE_OUT std::cout
 #define CONSOLE_IN std::cin
 #define CHRONO std::chrono
 
 CHRONO::steady_clock MASTER_CLOCK; // global monotonic clock for multi-threaded app
-std::mutex LOCK_CONSOLE_OUT;
+std::mutex LOCK_CONSOLE_OUT; // used for condition_variable
 std::condition_variable con_v;
-std::vector<std::thread::id> g_timedout_threads;
+std::vector<std::thread::id> g_timedout_threads; // holds timedout thread IDs to prevent race condition to console
+bool g_bool_lock_aq{true}; // predicate control for wait_for()
+std::mutex LOCK_BOOL; // locks predicate control variable used in wait_for()
 
 struct thread_timer
 {
-    CHRONO::time_point<CHRONO::steady_clock> start_time;
-    CHRONO::duration<int, std::milli> wait_time_out;
+    CHRONO::time_point<CHRONO::steady_clock> start_time; // time obj was created
+    CHRONO::duration<int, std::milli> wait_time_out; // timeout duration to prevent deadlock
 
      // only ctor takes time duration used for condition_variable wait
     thread_timer(const CHRONO::duration<int, std::milli> wto) 
@@ -31,27 +36,35 @@ struct thread_timer
             {}
     ~thread_timer()
     { 
-         // get unique_lock for condition variable - pass in same mutex as other threads
-        std::unique_lock<std::mutex> ul(LOCK_CONSOLE_OUT);
          // determine current clock time -> compute time elapsed
         CHRONO::time_point<CHRONO::steady_clock>end_time {MASTER_CLOCK.now()};
         CHRONO::duration<long long, std::nano> dur_elapsed = end_time-start_time;
          // cast duration from nanoseconds -> milliseconds 
         auto c_dur_elapsed = CHRONO::duration_cast<CHRONO::milliseconds>(dur_elapsed);
-        std::cv_status timeout_check {}; // hold .wait_for() return
-        timeout_check = con_v.wait_for(ul, wait_time_out); // wait for notification OR wait duration
-        if (timeout_check == std::cv_status::no_timeout)
+
+         // all threads aquire unique_lock prior to race-condition block
+        std::unique_lock<std::mutex> ul (LOCK_CONSOLE_OUT);
+         // g_bool_lock_aq is defaulted to TRUE -> whatever thread is notified first, will NOT wait
+         // as predicate will evaulate to true immediately upon initial call
+        con_v.notify_one();
+        if (con_v.wait_for(ul, wait_time_out, []()->bool{ return g_bool_lock_aq; }))
         {
-             // if no_timeout occured while waiting for lock -> race condition avoided
+             // if NO timeout occured -> lock global bool and set to false to prevent con_v wakeup
+            {
+                std::lock_guard<std::mutex> lg (LOCK_BOOL); // lock guard deleted at end of block
+                g_bool_lock_aq = false;
+            }
+             // read out thread timer to console
             CONSOLE_OUT << "Thread " << std::this_thread::get_id()
                 << " timed-out after... " << c_dur_elapsed.count()
                 << " ms.\n"; 
         }
-        else // if timeout occured while waiting for lock -> race condition possible -> push into global thread ID tracker
+         // lock and set to true prior to notify
         {
-            g_timedout_threads.push_back(std::this_thread::get_id());
+            std::lock_guard<std::mutex> lg (LOCK_BOOL); 
+            g_bool_lock_aq = true;
         }
-        con_v.notify_one(); // notify all waiting threads
+        con_v.notify_one(); // notify a waiting thread
     }
 };
 
@@ -79,9 +92,9 @@ int main()
      // must allocate space to prevent mem reallocation (realloc will cause issues with iterators)
     thread_p.reserve(tnum); 
     g_timedout_threads.reserve(tnum); // worst case - all threads fail
-     // compute 120% of max thread time + round up in milliseconds for wait_for time-out condition
-    auto a_mdur {CHRONO::milliseconds(static_cast<int>(std::ceil(mdur*2.5)*1000))};
-    CONSOLE_OUT << "MAX THREAD TIME ALLOCATED: " << a_mdur.count() << std::endl;
+     // compute 120% of max thread time + round in milliseconds for wait_for time-out condition
+    auto a_mdur {CHRONO::milliseconds(static_cast<int>(std::ceil(mdur*1.2)*1000))};
+    CONSOLE_OUT << "MAX THREAD TIME ALLOCATED: " << a_mdur.count() << "ms" <<  std::endl;
      // lambda to start thread timer & sleep thread based on random int returned
     auto l_run_thread = [=]()
             {
@@ -105,8 +118,15 @@ int main()
     }
     
      // read out any threads that reached .wait_for() duration
-    for (const std::thread::id& ids : g_timedout_threads)
-        CONSOLE_OUT << "Thread " << ids << " , timed-out during mutex wait.\n";
+    if (g_timedout_threads.empty())
+    {
+        CONSOLE_OUT << "No threads timed out.\n";
+    }
+    else
+    {
+        for (const std::thread::id& ids : g_timedout_threads)
+            CONSOLE_OUT << "Thread " << ids << " , timed-out during mutex wait.\n";
+    }
 
     return 0;
 }
